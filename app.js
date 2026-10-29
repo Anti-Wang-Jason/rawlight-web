@@ -1,6 +1,7 @@
 import LibRaw from './vendor/libraw/index.js';
 import {cropGeometry} from './geometry.js';
 import {validateRawMetadata} from './camera-support.js';
+import {makePhotoFile,canSharePhoto,sharePhoto} from './photo-export.js';
 const $=s=>document.querySelector(s), canvas=$('#canvas'), ctx=canvas.getContext('webgl',{preserveDrawingBuffer:true});
 const controls=[['exposure','曝光',-2,2,.05],['contrast','对比度',-100,100,1],['highlights','高光',-100,100,1],['shadows','阴影',-100,100,1],['whites','白色色阶',-100,100,1],['blacks','黑色色阶',-100,100,1],['temperature','色温',-100,100,1],['tint','色调',-100,100,1],['saturation','饱和度',-100,100,1],['vibrance','自然饱和度',-100,100,1],['dehaze','去朦胧',-100,100,1],['clarity','清晰度',-100,100,1],['sharpness','锐化',0,100,1],['denoise','明度降噪',0,100,1]];
 const looks=[['original','原片','#505b4e','#909a81'],['natural','自然','#506c58','#c3b28d'],['warm','暖调','#765d42','#d4a66c'],['cool','冷调','#3b5f61','#adbbc2'],['film','胶片','#675d4e','#c6bda0'],['vivid','鲜明','#394f42','#dfaa65'],['soft','柔和','#867d70','#decfc1'],['mono','黑白','#373b38','#b8bcb6']];
@@ -41,7 +42,34 @@ if(n!==token)return;newSource(img.width||img.naturalWidth,img.height||img.natura
 function rational(n){return [Math.round(n*10000),10000]}
 function metadataForExport(){let out={'0th':{},Exif:{},GPS:{},'1st':{},thumbnail:null};if(exif){let zero=[piexif.ImageIFD.Make,piexif.ImageIFD.Model,piexif.ImageIFD.DateTime];let ex=[piexif.ExifIFD.ExposureTime,piexif.ExifIFD.FNumber,piexif.ExifIFD.ISOSpeedRatings,piexif.ExifIFD.DateTimeOriginal,piexif.ExifIFD.DateTimeDigitized,piexif.ExifIFD.FocalLength,piexif.ExifIFD.LensMake,piexif.ExifIFD.LensModel];for(let k of zero)if(exif['0th']?.[k]!=null)out['0th'][k]=exif['0th'][k];for(let k of ex)if(exif.Exif?.[k]!=null)out.Exif[k]=exif.Exif[k]}else if(rawMeta){let m=rawMeta;if(m.camera_make)out['0th'][piexif.ImageIFD.Make]=m.camera_make;if(m.camera_model)out['0th'][piexif.ImageIFD.Model]=m.camera_model;if(m.shutter>0)out.Exif[piexif.ExifIFD.ExposureTime]=rational(m.shutter);if(m.aperture>0)out.Exif[piexif.ExifIFD.FNumber]=rational(m.aperture);if(m.iso_speed>0&&m.iso_speed<=65535)out.Exif[piexif.ExifIFD.ISOSpeedRatings]=Math.round(m.iso_speed);if(m.focal_len>0)out.Exif[piexif.ExifIFD.FocalLength]=rational(m.focal_len);if(m.lens?.Lens)out.Exif[piexif.ExifIFD.LensModel]=m.lens.Lens;if(m.lens?.LensMake)out.Exif[piexif.ExifIFD.LensMake]=m.lens.LensMake}
 out['0th'][piexif.ImageIFD.Orientation]=1;out.Exif[piexif.ExifIFD.PixelXDimension]=canvas.width;out.Exif[piexif.ExifIFD.PixelYDimension]=canvas.height;return out}
-async function exportJpeg(){if(!source)return;setBusy(true,'正在导出全尺寸 JPEG',false);await new Promise(r=>setTimeout(r,30));try{let g=cropGeometry(source.width,source.height,rotation,ratio);canvas.width=g.width;canvas.height=g.height;if(ctx.drawingBufferWidth!==g.width||ctx.drawingBufferHeight!==g.height)throw Error('设备无法创建全尺寸输出画布，请尝试电脑浏览器');draw();let url=canvas.toDataURL('image/jpeg',+$('#quality').value/100);if(!url.startsWith('data:image/jpeg'))throw Error('浏览器无法导出此尺寸的 JPEG');if($('#metadata').checked)url=piexif.insert(piexif.dump(metadataForExport()),url);let a=document.createElement('a');a.download=($('#filename').textContent.replace(/\.[^.]+$/,'')||'RawLight')+'-原光.jpg';a.href=url;a.click();notify('已请求下载，请在浏览器下载项目中查看');}catch(e){notify('导出失败：'+e.message)}finally{sizeCanvasForPreview();draw();setBusy(false)}}
+let preparedPhoto=null,preparedPhotoURL=null,exporting=false;
+function closeExport(){
+  if(preparedPhotoURL)URL.revokeObjectURL(preparedPhotoURL);
+  preparedPhotoURL=null;preparedPhoto=null;
+  $('#exportPreview').removeAttribute('src');$('#saveFile').removeAttribute('href');$('#shareStatus').textContent='';
+}
+function showExport(file,width,height){
+  closeExport();preparedPhoto=file;preparedPhotoURL=URL.createObjectURL(file);
+  $('#exportPreview').src=preparedPhotoURL;$('#saveFile').href=preparedPhotoURL;$('#saveFile').download=file.name;
+  $('#exportInfo').textContent=`${width} × ${height} · JPEG · ${(file.size/1048576).toFixed(1)} MB`;
+  $('#shareExport').hidden=!canSharePhoto(navigator,file);
+  $('#shareStatus').textContent=canSharePhoto(navigator,file)?'':'当前浏览器不支持直接分享文件，可长按照片或下载到文件。';
+  $('#exportDialog').showModal();
+}
+async function exportJpeg(){
+ if(!source||exporting)return;exporting=true;$('#file').disabled=true;document.querySelector('main').inert=true;document.querySelector('.top').inert=true;
+ setBusy(true,'正在导出全尺寸 JPEG',false);await new Promise(r=>setTimeout(r,30));
+ try{
+  let g=cropGeometry(source.width,source.height,rotation,ratio);canvas.width=g.width;canvas.height=g.height;
+  if(ctx.drawingBufferWidth!==g.width||ctx.drawingBufferHeight!==g.height)throw Error('设备无法创建全尺寸输出画布，请尝试电脑浏览器');
+  draw();let url=canvas.toDataURL('image/jpeg',+$('#quality').value/100);
+  if(!url.startsWith('data:image/jpeg'))throw Error('浏览器无法导出此尺寸的 JPEG');
+  if($('#metadata').checked)url=piexif.insert(piexif.dump(metadataForExport()),url);
+  let name=($('#filename').textContent.replace(/\.[^.]+$/,'')||'RawLight')+'-原光.jpg';
+  let file=await makePhotoFile(url,name);showExport(file,g.width,g.height);
+ }catch(e){notify('导出失败：'+(e.message||'设备无法处理这张照片'))}
+ finally{sizeCanvasForPreview();draw();setBusy(false);$('#file').disabled=false;document.querySelector('main').inert=false;document.querySelector('.top').inert=false;exporting=false}
+}
 
 function auto(){if(!source)return;undoState={...state};let temp=document.createElement('canvas');temp.width=temp.height=64;let t=temp.getContext('2d');t.drawImage(canvas,0,0,64,64);let d=t.getImageData(0,0,64,64).data,sum=0;for(let i=0;i<d.length;i+=4)sum+=(d[i]*.2126+d[i+1]*.7152+d[i+2]*.0722)/255;let lum=sum/(d.length/4);state.exposure=Math.max(-.5,Math.min(.5,Math.round(Math.log2(.45/Math.max(.05,lum))*10)/10));state.contrast=8;state.highlights=-12;state.shadows=12;state.vibrance=10;ui();render();notify('已应用自动调色，可继续调整或重置')}
-try{init()}catch(e){notify(e.message)}ui();$('#file').addEventListener('change',e=>load(e.target.files[0]));$('#cancelLoad').onclick=()=>{token++;raw?.dispose();raw=null;setBusy(false);notify('已取消打开照片')};$('#download').onclick=exportJpeg;$('#mobileDownload').onclick=exportJpeg;$('#auto').onclick=auto;$('#reset').onclick=()=>{state=Object.fromEntries(controls.map(c=>[c[0],0]));selected='original';strength=70;undoState=null;mix=channels.map(()=>[0,0,0]);channel=0;curve=[0,0,0];rotation=0;ratio='original';ui();applyGeometry()};$('#undo').onclick=()=>{if(!undoState)return;state=undoState;undoState=null;ui();render();notify('已撤销自动调色')};$('#cropRatio').onchange=e=>{ratio=e.target.value;applyGeometry()};$('#rotate').onclick=()=>{rotation=(rotation+1)%4;applyGeometry()};$('#quality').oninput=e=>$('#qualityVal').textContent=e.target.value;let compare=$('#compare');compare.addEventListener('pointerdown',e=>{e.preventDefault();compare.setPointerCapture(e.pointerId);draw(true)});compare.addEventListener('pointerup',()=>draw());compare.addEventListener('pointercancel',()=>draw());compare.addEventListener('keydown',e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();draw(true)}});compare.addEventListener('keyup',()=>draw());
+try{init()}catch(e){notify(e.message)}ui();$('#file').addEventListener('change',e=>load(e.target.files[0]));$('#cancelLoad').onclick=()=>{token++;raw?.dispose();raw=null;setBusy(false);notify('已取消打开照片')};$('#exportDialog').addEventListener('close',closeExport);$('#closeExport').onclick=()=>$('#exportDialog').close();$('#shareExport').onclick=()=>{if(!preparedPhoto)return;try{sharePhoto(navigator,preparedPhoto).then(()=>{$('#shareStatus').textContent='请在“照片”中确认是否已保存。'}).catch(e=>{$('#shareStatus').textContent=e?.name==='AbortError'?'已取消，可重新选择或长按照片保存。':'无法打开分享菜单，可长按照片保存或下载到文件。'})}catch(e){$('#shareStatus').textContent='无法打开分享菜单，可长按照片保存或下载到文件。'}};$('#download').onclick=exportJpeg;$('#mobileDownload').onclick=exportJpeg;$('#auto').onclick=auto;$('#reset').onclick=()=>{state=Object.fromEntries(controls.map(c=>[c[0],0]));selected='original';strength=70;undoState=null;mix=channels.map(()=>[0,0,0]);channel=0;curve=[0,0,0];rotation=0;ratio='original';ui();applyGeometry()};$('#undo').onclick=()=>{if(!undoState)return;state=undoState;undoState=null;ui();render();notify('已撤销自动调色')};$('#cropRatio').onchange=e=>{ratio=e.target.value;applyGeometry()};$('#rotate').onclick=()=>{rotation=(rotation+1)%4;applyGeometry()};$('#quality').oninput=e=>$('#qualityVal').textContent=e.target.value;let compare=$('#compare');compare.addEventListener('pointerdown',e=>{e.preventDefault();compare.setPointerCapture(e.pointerId);draw(true)});compare.addEventListener('pointerup',()=>draw());compare.addEventListener('pointercancel',()=>draw());compare.addEventListener('keydown',e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();draw(true)}});compare.addEventListener('keyup',()=>draw());
